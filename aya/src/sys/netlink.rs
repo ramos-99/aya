@@ -7,8 +7,9 @@ use std::{
 
 use aya_obj::generated::{
     IFLA_XDP_EXPECTED_FD, IFLA_XDP_FD, IFLA_XDP_FLAGS, NLMSG_ALIGNTO, TC_H_CLSACT, TC_H_INGRESS,
-    TC_H_MAJ_MASK, TC_H_UNSPEC, TCA_BPF_FD, TCA_BPF_FLAG_ACT_DIRECT, TCA_BPF_FLAGS, TCA_BPF_NAME,
-    TCA_KIND, TCA_OPTIONS, XDP_FLAGS_REPLACE, ifinfomsg, nlmsgerr_attrs::NLMSGERR_ATTR_MSG, tcmsg,
+    TC_H_MAJ_MASK, TC_H_UNSPEC, TCA_BPF_CLASSID, TCA_BPF_FD, TCA_BPF_FLAG_ACT_DIRECT,
+    TCA_BPF_FLAGS, TCA_BPF_NAME, TCA_KIND, TCA_OPTIONS, XDP_FLAGS_REPLACE, ifinfomsg,
+    nlmsgerr_attrs::NLMSGERR_ATTR_MSG, tcmsg,
 };
 use libc::{
     AF_NETLINK, AF_UNSPEC, ETH_P_ALL, IFF_UP, IFLA_XDP, NETLINK_CAP_ACK, NETLINK_EXT_ACK,
@@ -21,7 +22,7 @@ use thiserror::Error;
 
 use crate::{
     Pod,
-    programs::TcAttachType,
+    programs::{ClassId, TcAttachType, TcHandle},
     util::{bytes_of, tc_handler_make},
 };
 
@@ -45,7 +46,8 @@ const NLA_HDR_ALIGN_LEN: usize = nla_align!(NLA_HDR_LEN);
 const CLS_BPF_NAME_LEN: usize = 256;
 
 // Size of the attribute buffer needed by write_tc_attach_attrs:
-// TCA_KIND + nested TCA_OPTIONS containing TCA_BPF_FD, TCA_BPF_NAME, TCA_BPF_FLAGS.
+// TCA_KIND + nested TCA_OPTIONS containing TCA_BPF_FD, TCA_BPF_NAME,
+// TCA_BPF_CLASSID, TCA_BPF_FLAGS.
 const fn tc_request_attrs_size() -> usize {
     // TCA_KIND
     NLA_HDR_ALIGN_LEN + nla_align!(c"bpf".to_bytes_with_nul().len())
@@ -55,11 +57,13 @@ const fn tc_request_attrs_size() -> usize {
     + NLA_HDR_ALIGN_LEN + nla_align!(size_of::<i32>())
     // TCA_BPF_NAME
     + NLA_HDR_ALIGN_LEN + nla_align!(CLS_BPF_NAME_LEN)
+    // TCA_BPF_CLASSID
+    + NLA_HDR_ALIGN_LEN + nla_align!(size_of::<u32>())
     // TCA_BPF_FLAGS
     + NLA_HDR_ALIGN_LEN + nla_align!(size_of::<u32>())
 }
 
-const _: () = assert!(tc_request_attrs_size() == 288);
+const _: () = assert!(tc_request_attrs_size() == 296);
 
 /// A private error type for internal use in this module.
 #[derive(Error, Debug)]
@@ -197,6 +201,7 @@ fn write_tc_attach_attrs(
     nlmsg_len: usize,
     prog_fd: i32,
     prog_name: &[u8],
+    classid: Option<ClassId>,
 ) -> io::Result<()> {
     let attrs_buf = unsafe { request_attributes(req, nlmsg_len) };
 
@@ -206,6 +211,9 @@ fn write_tc_attach_attrs(
     let mut options = NestedAttrs::new(attrs_buf, TCA_OPTIONS as u16);
     options.write_attr(TCA_BPF_FD as u16, prog_fd)?;
     options.write_attr_bytes(TCA_BPF_NAME as u16, prog_name)?;
+    if let Some(classid) = classid {
+        options.write_attr(TCA_BPF_CLASSID as u16, u32::from(classid))?;
+    }
     options.write_attr(TCA_BPF_FLAGS as u16, TCA_BPF_FLAG_ACT_DIRECT)?;
     let options_len = options.finish()?;
 
@@ -213,15 +221,20 @@ fn write_tc_attach_attrs(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "netlink wire parameters are inherently numerous and span different domains"
+)]
 pub(crate) unsafe fn netlink_qdisc_attach(
     if_index: i32,
     attach_type: &TcAttachType,
     prog_fd: BorrowedFd<'_>,
     prog_name: &CStr,
     priority: u16,
-    handle: u32,
+    handle: TcHandle,
+    classid: Option<ClassId>,
     create: bool,
-) -> Result<(u16, u32), NetlinkError> {
+) -> Result<(u16, TcHandle), NetlinkError> {
     let sock = NetlinkSocket::open()?;
 
     let mut req = unsafe { mem::zeroed::<TcRequest>() };
@@ -248,7 +261,7 @@ pub(crate) unsafe fn netlink_qdisc_attach(
         nlmsg_seq: 1,
     };
     req.tc_info.tcm_family = AF_UNSPEC as u8;
-    req.tc_info.tcm_handle = handle; // auto-assigned, if zero
+    req.tc_info.tcm_handle = handle.into(); // auto-assigned, if zero
     req.tc_info.tcm_ifindex = if_index;
     req.tc_info.tcm_parent = attach_type.tc_parent();
     req.tc_info.tcm_info = tc_handler_make(
@@ -261,6 +274,7 @@ pub(crate) unsafe fn netlink_qdisc_attach(
         nlmsg_len,
         prog_fd.as_raw_fd(),
         prog_name.to_bytes_with_nul(),
+        classid,
     )
     .map_err(|e| NetlinkError(NetlinkErrorInternal::IoError(e)))?;
     sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
@@ -282,7 +296,7 @@ pub(crate) unsafe fn netlink_qdisc_attach(
         ))),
         [tc_msg] => {
             let priority = ((tc_msg.tcm_info & TC_H_MAJ_MASK) >> 16) as u16;
-            Ok((priority, tc_msg.tcm_handle))
+            Ok((priority, tc_msg.tcm_handle.into()))
         }
         _tc_msg => Err(NetlinkError(NetlinkErrorInternal::IoError(
             io::Error::other(
@@ -296,7 +310,7 @@ pub(crate) unsafe fn netlink_qdisc_detach(
     if_index: i32,
     attach_type: TcAttachType,
     priority: u16,
-    handle: u32,
+    handle: TcHandle,
 ) -> Result<(), NetlinkError> {
     let sock = NetlinkSocket::open()?;
 
@@ -311,7 +325,7 @@ pub(crate) unsafe fn netlink_qdisc_detach(
     };
 
     req.tc_info.tcm_family = AF_UNSPEC as u8;
-    req.tc_info.tcm_handle = handle; // auto-assigned, if zero
+    req.tc_info.tcm_handle = handle.into(); // auto-assigned, if zero
     req.tc_info.tcm_info = tc_handler_make(
         u32::from(priority) << 16,
         u32::from(htons(ETH_P_ALL as u16)),
@@ -333,7 +347,7 @@ pub(crate) fn netlink_find_filter_with_name(
     if_index: i32,
     attach_type: TcAttachType,
     name: &CStr,
-) -> Result<impl Iterator<Item = Result<(u16, u32), NetlinkError>>, NetlinkError> {
+) -> Result<impl Iterator<Item = Result<(u16, TcHandle), NetlinkError>>, NetlinkError> {
     let mut req = unsafe { mem::zeroed::<TcRequest>() };
 
     let nlmsg_len = size_of::<nlmsghdr>() + size_of::<tcmsg>();
@@ -391,7 +405,7 @@ pub(crate) fn netlink_find_filter_with_name(
                         if f_name != name {
                             continue;
                         }
-                        filter = Some((priority, tc_msg.tcm_handle));
+                        filter = Some((priority, tc_msg.tcm_handle.into()));
                     }
                 }
                 Ok(filter)
@@ -951,12 +965,42 @@ mod tests {
         assert_eq!(name.to_str().unwrap(), "foo");
     }
 
+    #[test]
+    fn test_write_tc_attach_attrs_classid() {
+        let mut req = unsafe { mem::zeroed::<TcRequest>() };
+        let name = b"test_prog\0";
+        let nlmsg_len = size_of::<nlmsghdr>() + size_of::<tcmsg>();
+        req.header.nlmsg_len = nlmsg_len as u32;
+
+        assert_matches!(
+            write_tc_attach_attrs(&mut req, nlmsg_len, 0, name, None),
+            Ok(())
+        );
+
+        assert_matches!(
+            write_tc_attach_attrs(
+                &mut req,
+                nlmsg_len,
+                0,
+                name,
+                Some(ClassId::from_parts(1, 10))
+            ),
+            Ok(())
+        );
+    }
+
     fn tc_request(name: &[u8]) -> io::Result<()> {
         let mut req = unsafe { mem::zeroed::<TcRequest>() };
         let nlmsg_len = size_of::<nlmsghdr>() + size_of::<tcmsg>();
         req.header.nlmsg_len = nlmsg_len as u32;
 
-        write_tc_attach_attrs(&mut req, nlmsg_len, 0, name)
+        write_tc_attach_attrs(
+            &mut req,
+            nlmsg_len,
+            0,
+            name,
+            Some(ClassId::from_parts(0, 0)),
+        )
     }
 
     /// Verify that [`TcRequest`] fits all the attributes [`write_tc_attach_attrs`]

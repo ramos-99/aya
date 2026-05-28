@@ -139,6 +139,68 @@ pub enum TcAttachOptions {
     TcxOrder(LinkOrder),
 }
 
+/// A TC filter handle in `major:minor` format.
+/// Defaults to `0:0`, which lets the kernel assign one automatically.
+#[derive(Debug, Clone, Copy, Default, Hash, Eq, PartialEq)]
+pub struct TcHandle(u32);
+
+impl TcHandle {
+    /// Creates a handle from a `major:minor` pair.
+    pub const fn from_parts(major: u16, minor: u16) -> Self {
+        Self(((major as u32) << 16) | (minor as u32))
+    }
+
+    /// Returns the major component.
+    pub const fn major(&self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    /// Returns the minor component.
+    pub const fn minor(&self) -> u16 {
+        self.0 as u16
+    }
+}
+
+impl From<TcHandle> for u32 {
+    fn from(handle: TcHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<u32> for TcHandle {
+    fn from(handle: u32) -> Self {
+        Self(handle)
+    }
+}
+
+/// A TC classid (also called `flowid`) in `major:minor` format.
+/// Identifies the traffic class that matched packets should be directed to.
+#[derive(Debug, Clone, Copy, Default, Hash, Eq, PartialEq)]
+pub struct ClassId(u32);
+
+impl ClassId {
+    /// Creates a classid from a `major:minor` pair.
+    pub const fn from_parts(major: u16, minor: u16) -> Self {
+        Self(((major as u32) << 16) | (minor as u32))
+    }
+
+    /// Returns the major component.
+    pub const fn major(&self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    /// Returns the minor component.
+    pub const fn minor(&self) -> u16 {
+        self.0 as u16
+    }
+}
+
+impl From<ClassId> for u32 {
+    fn from(classid: ClassId) -> Self {
+        classid.0
+    }
+}
+
 /// Options for [`SchedClassifier`] attach via netlink.
 #[derive(Debug, Default, Hash, Eq, PartialEq)]
 pub struct NlOptions {
@@ -147,7 +209,10 @@ pub struct NlOptions {
     pub priority: u16,
     /// Handle used to uniquely identify a program at a given priority level.
     /// If set to default (0), the system chooses a handle.
-    pub handle: u32,
+    pub handle: TcHandle,
+    /// TC class targeted by packets matched by this filter.
+    /// If [`None`], no class is targeted.
+    pub classid: Option<ClassId>,
 }
 
 impl SchedClassifier {
@@ -290,10 +355,15 @@ impl SchedClassifier {
                 attach_type,
                 priority,
                 handle,
+                classid,
             }) => self.do_attach(
                 if_index,
                 attach_type,
-                TcAttachOptions::Netlink(NlOptions { priority, handle }),
+                TcAttachOptions::Netlink(NlOptions {
+                    priority,
+                    handle,
+                    classid,
+                }),
                 false,
             ),
         }
@@ -322,6 +392,7 @@ impl SchedClassifier {
                         &name,
                         options.priority,
                         options.handle,
+                        options.classid,
                         create,
                     )
                 }
@@ -334,6 +405,7 @@ impl SchedClassifier {
                         attach_type,
                         priority,
                         handle,
+                        classid: options.classid,
                     })))
             }
             TcAttachOptions::TcxOrder(options) => {
@@ -410,14 +482,15 @@ impl SchedClassifier {
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
-pub(crate) struct NlLinkId(u32, TcAttachType, u16, u32);
+pub(crate) struct NlLinkId(u32, TcAttachType, u16, TcHandle);
 
 #[derive(Debug)]
 pub(crate) struct NlLink {
     if_index: u32,
     attach_type: TcAttachType,
     priority: u16,
-    handle: u32,
+    handle: TcHandle,
+    classid: Option<ClassId>,
 }
 
 impl Link for NlLink {
@@ -518,19 +591,19 @@ impl SchedClassifierLink {
     /// # Examples
     /// ```no_run
     /// # use aya::programs::tc::SchedClassifierLink;
-    /// # use aya::programs::TcAttachType;
+    /// # use aya::programs::{TcAttachType, TcHandle, ClassId};
     /// # #[derive(Debug, thiserror::Error)]
     /// # enum Error {
     /// #     #[error(transparent)]
     /// #     IO(#[from] std::io::Error),
     /// # }
-    /// # fn read_persisted_link_details() -> (&'static str, TcAttachType, u16, u32) {
-    /// #     ("eth0", TcAttachType::Ingress, 50, 1)
+    /// # fn read_persisted_link_details() -> (&'static str, TcAttachType, u16, TcHandle, Option<ClassId>) {
+    /// #     ("eth0", TcAttachType::Ingress, 50, TcHandle::from_parts(0, 1), None)
     /// # }
     /// // Get the link parameters from some external source. Where and how the parameters are
     /// // persisted is up to your application.
-    /// let (if_name, attach_type, priority, handle) = read_persisted_link_details();
-    /// let new_tc_link = SchedClassifierLink::attached(if_name, attach_type, priority, handle)?;
+    /// let (if_name, attach_type, priority, handle, classid) = read_persisted_link_details();
+    /// let new_tc_link = SchedClassifierLink::attached(if_name, attach_type, priority, handle, classid)?;
     ///
     /// # Ok::<(), Error>(())
     /// ```
@@ -538,7 +611,8 @@ impl SchedClassifierLink {
         if_name: &str,
         attach_type: TcAttachType,
         priority: u16,
-        handle: u32,
+        handle: TcHandle,
+        classid: Option<ClassId>,
     ) -> Result<Self, io::Error> {
         let if_index = ifindex_from_ifname(if_name)?;
         Ok(Self(Some(TcLinkInner::NlLink(NlLink {
@@ -546,6 +620,7 @@ impl SchedClassifierLink {
             attach_type,
             priority,
             handle,
+            classid,
         }))))
     }
 
@@ -568,9 +643,18 @@ impl SchedClassifierLink {
     }
 
     /// Returns the assigned handle. If none was provided at attach time, this was allocated for you.
-    pub fn handle(&self) -> Result<u32, ProgramError> {
+    pub fn handle(&self) -> Result<TcHandle, ProgramError> {
         if let TcLinkInner::NlLink(n) = self.inner() {
             Ok(n.handle)
+        } else {
+            Err(TcError::InvalidLinkOperation.into())
+        }
+    }
+
+    /// Returns the classid set at attach time, or [`None`] if no classid was set.
+    pub fn classid(&self) -> Result<Option<ClassId>, ProgramError> {
+        if let TcLinkInner::NlLink(n) = self.inner() {
+            Ok(n.classid)
         } else {
             Err(TcError::InvalidLinkOperation.into())
         }
@@ -617,4 +701,27 @@ pub fn qdisc_detach_program(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classid() {
+        let cid = ClassId::from_parts(1, 10);
+        assert_eq!(cid.major(), 1);
+        assert_eq!(cid.minor(), 10);
+        assert_eq!(u32::from(cid), 0x0001000A);
+        assert_eq!(u32::from(ClassId::default()), 0);
+    }
+
+    #[test]
+    fn test_tchandle() {
+        let handle = TcHandle::from_parts(0x1234, 0x5678);
+        assert_eq!(handle.major(), 0x1234);
+        assert_eq!(handle.minor(), 0x5678);
+        assert_eq!(u32::from(handle), 0x12345678);
+        assert_eq!(u32::from(TcHandle::default()), 0);
+    }
 }
